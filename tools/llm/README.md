@@ -1,6 +1,6 @@
 # Optimizing LLMs in Torch-TensorRT
 
-This directory provides utilities and scripts for compiling, optimizing, and benchmarking Large Language Models (LLMs) and Visual Language Models (VLMs) using Torch-TensorRT, with a focus on efficient inference on NVIDIA GPUs. The main entry points are `run_llm.py` for text-only LLMs and `run_vlm.py` for vision-language models. Note that this is an **experimental release** and APIs may change in future versions.
+This directory provides utilities and scripts for compiling, optimizing, and benchmarking Large Language Models (LLMs) and Visual Language Models (VLMs) using Torch-TensorRT, with a focus on efficient inference on NVIDIA GPUs. The main entry points are `run_llm.py` for text-only LLMs, `run_vlm.py` for vision-language models and `run_vla.py` for vision-language-action models (Alpamayo). Note that this is an **experimental release** and APIs may change in future versions.
 
 ### Key Features
 
@@ -46,6 +46,19 @@ python run_llm.py --model meta-llama/Llama-3.2-1B-Instruct --prompt "What is par
 
 ```bash
 python run_vlm.py --model nvidia/Eagle2-2B --precision FP16 --num_tokens 128 --cache static_v1 --enable_pytorch_run --benchmark
+```
+
+#### Vision-Language-Action models: `run_vla.py`
+
+`run_vla.py` runs [Alpamayo 1.5](https://huggingface.co/nvidia/Alpamayo-1.5-10B) (Qwen3-VL backbone + flow-matching
+action expert) as separate Torch-TensorRT engines for the vision tower, the text decoder (`static_cache_v2` on
+the unmodified Hugging Face layers, split into segments, chunked prefill) and the expert. It needs the
+`alpamayo1_5` package for the model and data.
+
+```bash
+python run_vla.py --mode build --component all --clip_id <clip uuid>      # one process per engine
+python run_vla.py --mode reference --clip_id <clip uuid> --save ref.pt    # PyTorch rollout
+python run_vla.py --mode run --clip_id <clip uuid> --ref ref.pt           # TensorRT rollout + comparison
 ```
 
 #### Key Arguments
