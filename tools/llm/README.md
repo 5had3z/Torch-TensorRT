@@ -61,6 +61,9 @@ python run_vla.py --mode reference --clip_id <clip uuid> --save ref.pt    # PyTo
 python run_vla.py --mode run --clip_id <clip uuid> --ref ref.pt           # TensorRT rollout + comparison
 ```
 
+`--model` can also be a ModelOpt FP8 checkpoint directory (one with a `modelopt_state.pth`; needs `nvidia-modelopt`).
+The FP8 path needs two workarounds for TensorRT problems, described in [run_vla_fp8_notes.md](run_vla_fp8_notes.md).
+
 #### Key Arguments
 
 - `--model`: Name or path of the HuggingFace LLM/VLM.

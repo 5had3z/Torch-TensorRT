@@ -28,17 +28,21 @@ Requires the ``alpamayo1_5`` package (and its dataset access) for the model and 
     python run_vla.py --mode reference --clip_id <clip uuid> --save ref.pt
     python run_vla.py --mode run --clip_id <clip uuid> --ref ref.pt
 
-Only the plain FP16 checkpoint is supported here.
+The model is either the plain FP16 checkpoint or a ModelOpt FP8 checkpoint (a directory with a
+``modelopt_state.pth``, see ``recipes/alpamayo1_5_quant``; needs ``nvidia-modelopt``). For FP8 the
+weights are re-materialized as FP16 + fake-quant, so the exported graph carries plain Q/DQ nodes that
+Torch-TensorRT folds into FP8 weights and activations.
 """
 
 import argparse
+import contextlib
 import gc
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Tuple
 
 import numpy as np
 import torch
@@ -103,6 +107,13 @@ def get_args():
         default=1,
         help="tokens per decoder call TensorRT tunes for (1 = decoding)",
     )
+    ap.add_argument(
+        "--fp8_attention_output_quant",
+        action="store_true",
+        help="FP8 checkpoints: also quantize the decoder's attention output (o_proj input). Off by "
+        "default: TensorRT builds a wrong engine for some chunked-prefill windows (see "
+        "disable_attention_output_quantizers)",
+    )
     ap.add_argument("--top_p", type=float, default=0.98)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--seed", type=int, default=42)
@@ -124,11 +135,20 @@ def get_args():
 # %%
 # Model and data
 # ^^^^^^^^^^^^^^
+def is_quantized(name: str) -> bool:
+    """A ModelOpt-quantized checkpoint directory."""
+    return (Path(name) / "modelopt_state.pth").exists()
+
+
 def load_model(name: str):
     try:
         from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
     except ImportError as e:
         raise SystemExit(f"run_vla.py needs the `alpamayo1_5` package: {e}")
+    if is_quantized(name):
+        import modelopt.torch.opt as mto
+
+        mto.enable_huggingface_checkpointing()
     kwargs = {}
     try:
         import flash_attn  # noqa: F401
@@ -179,6 +199,88 @@ def cast_to_fp16(module: torch.nn.Module) -> None:
         for name, b in list(m._buffers.items()):
             if b is not None and b.dtype in wide:
                 m._buffers[name] = b.to(torch.float16)
+
+
+def dequantize_real_quant_weights(module: torch.nn.Module) -> None:
+    """Turn ModelOpt real-quantized (compressed FP8) weights back into FP16 + fake-quant.
+
+    The checkpoint stores weights as ``float8_e4m3fn`` and dequantizes inside the weight quantizer,
+    which cannot be traced. Re-materializing the (already on-grid) FP16 weight and switching the
+    quantizer to fake-quant gives a plain Q/DQ graph that TensorRT folds into FP8 weights. A no-op
+    for the FP16 model.
+    """
+    from modelopt.torch.quantization.nn import TensorQuantizer
+
+    for m in module.modules():
+        wq = getattr(m, "weight_quantizer", None)
+        if isinstance(wq, TensorQuantizer) and wq.is_enabled and wq._dequantize:
+            with torch.no_grad():
+                # ``m.weight`` is the raw compressed tensor; the quantizer (still in dequantize
+                # mode) turns it back into values exactly as its forward does.
+                w = wq(m._parameters["weight"]).detach().to(torch.float16)
+            wq._dequantize = False
+            wq._fake_quant = True  # must precede the assignment, else the weight is re-compressed
+            m._parameters["weight"] = torch.nn.Parameter(w, requires_grad=False)
+            m.allow_real_quant_gemm = False  # no real-quant GEMM kernels while tracing
+
+
+def separate_sibling_input_scales(module: torch.nn.Module) -> None:
+    """Make the input scales of sibling FP8 linears (q/k/v, gate/up) differ in the last bit.
+
+    The siblings read the same activation, so their calibrated input amax is identical, while their
+    weight amax differs. With identical input Q/DQ and different weight scales TensorRT builds an
+    engine whose output is all NaN (reproduced on a single MLP of the Alpamayo decoder, with random
+    weights too; equal weight scales or any difference in the input scales avoid it). A 0.2% change
+    of an input scale is far below the FP8 grid spacing (6%).
+    """
+    for m in module.modules():
+        for group in (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")):
+            if not all(hasattr(m, name) for name in group):
+                continue
+            seen = set()
+            for name in group:
+                q = getattr(m, name).input_quantizer
+                if q.amax is None:
+                    continue
+                while q.amax.item() in seen:
+                    q.amax = (q.amax * 1.002).to(q.amax.dtype)
+                seen.add(q.amax.item())
+
+
+def disable_attention_output_quantizers(module: torch.nn.Module) -> None:
+    """Leave the attention output (the ``o_proj`` input) unquantized in the decoder.
+
+    TensorRT fuses the FP8 Q/DQ of the attention output into the epilogue of the P.V matmul. With
+    the decoder's dynamic key length that engine is wrong for some windows of a chunked prefill: in
+    layer 14 of the Alpamayo decoder, 1 of 49 chunks (2240..2303) has 38% error per token, and the
+    errors accumulate over the layers (minADE +0.4 m). Without the quantizer the matmul is not
+    fused and ``o_proj`` runs in FP16; the engine then matches the eager FP8 model.
+    """
+    for m in module.modules():
+        o_proj = getattr(m, "o_proj", None)
+        if o_proj is not None and hasattr(o_proj, "input_quantizer"):
+            o_proj.input_quantizer.disable()
+
+
+def prepare_weights(
+    module: torch.nn.Module, quantized: bool, attention_output_quant: bool = True
+) -> None:
+    cast_to_fp16(module)
+    if quantized:
+        dequantize_real_quant_weights(module)
+        separate_sibling_input_scales(module)
+        if not attention_output_quant:
+            disable_attention_output_quantizers(module)
+
+
+def bmm_quantize(attn: torch.nn.Module, q, k, v):
+    """ModelOpt's attention q/k/v fake-quantizers (FP8 checkpoints; identity for FP16).
+
+    The Hugging Face decoder layers apply them themselves, the hand-written attention below does
+    not. They matter: the layer-0 keys have attention-sink outliers that the k quantizer saturates.
+    """
+    qz = [getattr(attn, f"{n}_bmm_quantizer", None) for n in "qkv"]
+    return tuple(f(t) if f is not None else t for f, t in zip(qz, (q, k, v)))
 
 
 def min_ade(pred_xyz, data) -> float:
@@ -237,6 +339,7 @@ class StaticVisionEncoder(torch.nn.Module):
             ).transpose(1, 2)
             for t in (q, k, v)
         )
+        q, k, v = bmm_quantize(attn, q, k, v)
         out = F.scaled_dot_product_attention(q, k, v, scale=attn.scaling)
         return attn.proj(out.transpose(1, 2).reshape(seq, -1))
 
@@ -353,7 +456,9 @@ class ExpertStep(torch.nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             k = torch.cat([caches[2 * i], k], dim=2)
             v = torch.cat([caches[2 * i + 1], v], dim=2)
-            out = _folded_gqa_sdpa(q, k, v, mask, attn.scaling)
+            # after the concat, as in the HF layer: the expert's quantizers see the whole K/V
+            q, k, v = bmm_quantize(attn, q, k, v)
+            out =_folded_gqa_sdpa(q, k, v, mask, attn.scaling)
             h = h + attn.o_proj(out.transpose(1, 2).reshape(B, L, -1))
             h = h + layer.mlp(layer.post_attention_layernorm(h))
         return self.action_out_proj(self.norm(h))
@@ -371,7 +476,16 @@ def trt_input(shape, dtype, min_shape=None, max_shape=None):
     )
 
 
-def compile_and_save(build: Callable, out_path: Path):
+def export_context(quantized: bool):
+    """ModelOpt's export mode turns the quantizers into ``tensorrt::quantize_op`` Q/DQ nodes."""
+    if not quantized:
+        return contextlib.nullcontext()
+    from modelopt.torch.quantization.utils import export_torch_mode
+
+    return export_torch_mode()
+
+
+def compile_and_save(build: Callable, out_path: Path, quantized: bool = False):
     """``build()`` -> (module, example_args, dynamic_shapes, trt_inputs).
 
     The builder owns the only references to the large module: it is dropped before ``save`` so host
@@ -379,9 +493,10 @@ def compile_and_save(build: Callable, out_path: Path):
     """
     module, example_args, dynamic_shapes, trt_inputs = build()
     with torch.no_grad():
-        ep = torch.export.export(
-            module, tuple(example_args), dynamic_shapes=dynamic_shapes, strict=False
-        )
+        with export_context(quantized):
+            ep = torch.export.export(
+                module, tuple(example_args), dynamic_shapes=dynamic_shapes, strict=False
+            )
         trt_mod = torch_tensorrt.dynamo.compile(
             ep,
             inputs=trt_inputs,
@@ -409,25 +524,35 @@ def build_vision(args):
     _, tokenized = load_inputs(model, args)
     pixel_values = tokenized["pixel_values"].to(DEVICE, torch.float16)
     grid_thw = tokenized["image_grid_thw"].to(DEVICE)
+    quantized = is_quantized(args.model)
     visual = model.vlm.model.visual.eval()
     cast_to_fp16(visual)
+    cosine = lambda a, b: F.cosine_similarity(  # noqa: E731
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
     with torch.no_grad():
-        ref, _ = visual(pixel_values, grid_thw)
+        ref_real, _ = visual(pixel_values, grid_thw)  # the original (real-quantized) module
+    prepare_weights(visual, quantized)
+    with torch.no_grad():
+        ref, _ = visual(pixel_values, grid_thw)  # the original forward on the exported weights
     encoder = StaticVisionEncoder(visual, grid_thw).eval()
     with torch.no_grad():
         out, _ = encoder(pixel_values)
-    cos = F.cosine_similarity(
-        out.float().flatten(), ref.float().flatten(), dim=0
-    ).item()
-    print(f"[vision] wrapper vs original cosine {cos:.6f}")
+    print(f"[vision] wrapper vs original cosine {cosine(out, ref):.6f}")
+    if quantized:  # FP8 GEMMs and fake-quant FP16 GEMMs round differently at the FP8 grid
+        print(f"[vision] fake-quant vs real-quant FP8 cosine {cosine(ref, ref_real):.6f}")
+    # FP8 rounding differences between two equivalent implementations compound through the tower
+    # (checked block by block: 0.999998 after block 0, drifting down with depth).
+    threshold = 0.95 if quantized else 0.999
     assert (
-        cos > 0.999
+        cosine(out, ref) > threshold
     ), "the static vision wrapper does not reproduce the HF vision tower"
     del model, visual
     gc.collect()
     compile_and_save(
         lambda: (encoder, (pixel_values,), None, [pixel_values]),
         Path(args.engine_dir) / "vision.ep",
+        quantized,
     )
 
 
@@ -444,7 +569,7 @@ def build_llm_segment(args, layer_range):
     seg = (
         cls(text_model, model.vlm.lm_head, layer_range, num_deepstack).to(DEVICE).eval()
     )
-    cast_to_fp16(seg)
+    prepare_weights(seg, is_quantized(args.model), args.fp8_attention_output_quant)
     H = text_model.config.hidden_size
     del model, text_model
     gc.collect()
@@ -501,6 +626,7 @@ def build_llm(args):
         compile_and_save(
             lambda r=layer_range: build_llm_segment(args, r),
             Path(args.engine_dir) / f"llm_{idx}.ep",
+            is_quantized(args.model),
         )
         gc.collect()
 
@@ -513,7 +639,7 @@ def build_expert(args):
             .to(DEVICE)
             .eval()
         )
-        cast_to_fp16(step)
+        prepare_weights(step, is_quantized(args.model))
         cfg = model.expert.config
         layers = len(model.expert.layers)
         T, C = model.action_space.get_action_space_dims()
@@ -540,7 +666,9 @@ def build_expert(args):
         ]
         return step, example, None, inputs
 
-    compile_and_save(build, Path(args.engine_dir) / "expert.ep")
+    compile_and_save(
+        build, Path(args.engine_dir) / "expert.ep", is_quantized(args.model)
+    )
 
 
 def run_build(args):
@@ -847,15 +975,13 @@ class TrtAlpamayo:
 def run_trt(args):
     from alpamayo1_5.models.token_utils import extract_text_tokens
 
-    model = load_model(
-        args.model
-    )  # CPU: only the tokenizer / host-side pieces are used
+    # CPU: only the tokenizer / host-side pieces are used
+    model = load_model(args.model)
     data, tokenized = load_inputs(model, args)
     pipe = TrtAlpamayo(model, args)
 
-    for i in range(
-        2 if args.resident else 1
-    ):  # 1st call includes lazy engine/context setup
+    # 1st call includes lazy engine/context setup
+    for i in range(2 if args.resident else 1):
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
         t = time.perf_counter()
