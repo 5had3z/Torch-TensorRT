@@ -79,15 +79,35 @@ concentrated in a few tokens.
   fine;
 * in layer 14, 48 of the 49 prefill chunks (64 tokens each) are correct to under 1% and exactly one, tokens
   2240 to 2303, has a 38% error per token. Other layers have a different bad chunk;
-* in the engine, the Q of the attention output is fused into the epilogue of the P.V matmul
-  (`sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion`); without the quantizer the matmul is a plain GEMM and
-  `o_proj` runs as an FP16 GEMM.
+* in the engine, the Q of the attention output is fused with the P.V matmul into one Myelin kernel
+  (`__myl_FcCastMulCast`, tactic `sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion_tactic`, FP16 P and V in,
+  FP8 out); without the quantizer the matmul is a plain GEMM and `o_proj` runs as an FP16 GEMM.
+
+**Mechanism.** The fused kernel is launched on the current buffers but with the key-length dependent
+parameters of an earlier call: the GEMM K extent, the row and batch strides of P and the batch stride of V.
+Recomputing the window (2240, 2304) in PyTorch with the converter's GQA layout (P `[kv_heads, groups*T, S]`,
+V `[kv_heads, S, head_dim]`) and all of these parameters taken from S=2240 matches the engine output to 0.3%;
+the correct result is 38% away, and making only one of the parameters stale does not match either. The
+quantize itself is correct. This is a TensorRT runtime bug (confirmed with 11.4.0.106 and 11.5.0.34), not a
+problem of the ModelOpt Q/DQ or of the Torch-TensorRT converters.
 
 **Conditions.** The engine uses `static_cache_v2` (dynamic key length) with a dynamic batch dimension (1 to 6);
-a static batch does not fail. It depends on the data: random weights or random activations of the same shapes
-pass, the real layer weights and hidden states fail. It is deterministic but depends on the preceding call: the
-same window (2240, 2304) with the same cache is wrong after (2176, 2240) or after itself and correct after a
-call with another shape. I did not find the mechanism.
+a static batch did not fail. The plain TensorRT Python API reproduces it with the dumped engine, so the
+Torch-TensorRT runtime is not involved. The result depends on the shape history of the execution context, not
+on the data:
+
+* of S=2240 and S=2304 (batch 1, 64 tokens), whichever runs first is correct and the other is wrong, and stays
+  wrong when repeated; another shape in between (for example S=1000) avoids it. This looks like a shape-keyed
+  cache of launch parameters in which the two shapes collide;
+* a preceding call with zero activations and zero caches breaks the next call just as well; a preceding call
+  with batch 2 or another number of tokens does not;
+* `compute-sanitizer` (initcheck, memcheck) reports no errors and the output is still wrong under it;
+  `max_aux_streams=0` changes nothing;
+* running every 64-token window right after the window that ends at its start, 32 of 2959 windows are wrong
+  (ends 2265 to 2272, 2289 to 2304 and 2801 to 2808); the engine without the quantizer has none.
+
+The earlier observation that random weights or activations pass is most likely because with spread-out
+attention the stale K and strides barely change the output (not verified).
 
 **Reproduction.** `fp8_attn_out_fusion.py` in the `repro` folder: one attention block of layer 14 
 (about 110 MB of weights and activations, written by its `make-pack` subcommand), compiled with

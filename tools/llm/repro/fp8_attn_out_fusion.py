@@ -13,12 +13,20 @@ chunk is compared with the eager (fake-quant) block.
 Expected: every chunk matches (relative error ~1e-2 or less per token, the FP8 grid noise).
 Observed:  chunk 2240..2303 has ~38% error per token (the other 48 chunks are fine). The engine is
 wrong only with the FP8 quantizer on the ``o_proj`` input (the attention output): TensorRT then fuses
-the Q into the epilogue of the P.V GEMM (``sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion``).
-``--control`` disables that quantizer: the GEMM is not fused and all chunks match.
+the P.V GEMM, the Q scale and the FP8 cast into one Myelin kernel (``__myl_FcCastMulCast``, tactic
+``sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion_tactic``). ``--control`` disables that quantizer:
+the GEMM is not fused and all chunks match.
 
-The result depends on the data and on the dynamic batch dimension: random weights or random
-activations of the same shapes do not fail, and neither does a static batch, so the real tensors are
-needed (``make-pack``, ~110 MB).
+Cause: the fused kernel is launched with the key-length dependent parameters (GEMM K extent, P row and
+batch strides, V batch stride) of a previous call with another key length. Chunked prefill runs the
+window ending at 2240 right before the one ending at 2304, and these two shapes appear to collide in a
+shape-keyed cache of launch parameters, so the second one runs with the first one's parameters. The
+result depends on the shape history of the execution context, not on the data: whichever of the two
+shapes runs first is correct. The plain TensorRT API reproduces it with the dumped engine.
+
+The real tensors (``make-pack``, ~110 MB) are still used because with random weights or activations
+the attention is spread out and the stale parameters barely change the output (likely, not verified).
+A static batch does not fail, probably because it selects another tactic.
 
 Usage
 -----
