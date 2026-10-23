@@ -106,13 +106,16 @@ on the data:
 * running every 64-token window right after the window that ends at its start, 32 of 2959 windows are wrong
   (ends 2265 to 2272, 2289 to 2304 and 2801 to 2808); the engine without the quantizer has none.
 
-The earlier observation that random weights or activations pass is most likely because with spread-out
-attention the stale K and strides barely change the output (not verified).
+The bug happens for any data, but it is only visible when the attention is peaked: with spread-out
+attention the stale K and strides barely change the output. With random weights and activations and
+q/k RMSNorm weights of 3 (the real ones reach 2.5 and 4.4) the same chunk is off by 110%; with 1 it is
+off by only 7%, which is why random tensors seemed to pass at first.
 
-**Reproduction.** `fp8_attn_out_fusion.py` in the `repro` folder: one attention block of layer 14 
-(about 110 MB of weights and activations, written by its `make-pack` subcommand), compiled with
-`static_cache_v2` and run as chunked prefill. It fails on chunk 2240 to 2303; `--control` disables the
-`o_proj` input quantizer and passes.
+**Reproduction.** `fp8_attn_out_fusion.py` in the `repro` folder: one attention block with the shapes of
+layer 14 and random weights and activations, compiled with `static_cache_v2` and run as chunked prefill.
+It fails on chunk 2240 to 2303; `--control` disables the `o_proj` input quantizer and passes. `--pack`
+runs it with the real weights and activations of layer 14 instead (about 110 MB, written by the
+`make-pack` subcommand), where the same chunk is off by 38%.
 
 **Workaround.** `disable_attention_output_quantizers` leaves the attention output of the decoder unquantized
 (the `o_proj` GEMMs of the decoder then run in FP16). `--fp8_attention_output_quant` brings the quantizer

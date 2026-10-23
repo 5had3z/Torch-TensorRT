@@ -4,18 +4,20 @@ windows of a chunked prefill (Qwen3-VL attention block with a dynamic key length
 What it does
 ------------
 One attention block (input RMSNorm, q/k/v projections, per-head q/k RMSNorm, rotary, causal GQA SDPA,
-``o_proj``, residual) with ModelOpt FP8 quantizers on the four linears, taken from layer 14 of the
-Alpamayo 1.5 FP8 decoder. It is compiled by Torch-TensorRT with ``static_cache_v2`` (KV cache inputs,
-``start_idx``/``end_idx`` scalars, dynamic key length) with a dynamic batch (1..6) and sequence (1..64),
-and run as chunked prefill at batch 1, 64 tokens per call, on the 3086-token prompt the layer saw. Every 
-chunk is compared with the eager (fake-quant) block.
+``o_proj``, residual) with ModelOpt FP8 quantizers on the four linears, with the shapes of layer 14
+of the Alpamayo 1.5 FP8 decoder (Qwen3-VL: hidden 4096, 32 query / 8 KV heads, head dim 128) and
+random weights and activations, or the real ones with ``--pack``. It is compiled by Torch-TensorRT
+with ``static_cache_v2`` (KV cache inputs, ``start_idx``/``end_idx`` scalars, dynamic key length)
+with a dynamic batch (1..6) and sequence (1..64), and run as chunked prefill at batch 1, 64 tokens
+per call, on a 3086-token prompt (the length of the real one). Every chunk is compared with the
+eager (fake-quant) block.
 
 Expected: every chunk matches (relative error ~1e-2 or less per token, the FP8 grid noise).
-Observed:  chunk 2240..2303 has ~38% error per token (the other 48 chunks are fine). The engine is
-wrong only with the FP8 quantizer on the ``o_proj`` input (the attention output): TensorRT then fuses
-the P.V GEMM, the Q scale and the FP8 cast into one Myelin kernel (``__myl_FcCastMulCast``, tactic
-``sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion_tactic``). ``--control`` disables that quantizer:
-the GEMM is not fused and all chunks match.
+Observed:  chunk 2240..2303 has ~110% error per token (~38% with the real weights); the other 48
+chunks are fine. The engine is wrong only with the FP8 quantizer on the ``o_proj`` input (the
+attention output): TensorRT then fuses the P.V GEMM, the Q scale and the FP8 cast into one Myelin
+kernel (``__myl_FcCastMulCast``, tactic ``sm80_xmma_gemm_f16f16_f16f16_f16_nn_..._by_fusion_tactic``).
+``--control`` disables that quantizer: the GEMM is not fused and all chunks match.
 
 Cause: the fused kernel is launched with the key-length dependent parameters (GEMM K extent, P row and
 batch strides, V batch stride) of a previous call with another key length. Chunked prefill runs the
@@ -24,18 +26,22 @@ shape-keyed cache of launch parameters, so the second one runs with the first on
 result depends on the shape history of the execution context, not on the data: whichever of the two
 shapes runs first is correct. The plain TensorRT API reproduces it with the dumped engine.
 
-The real tensors (``make-pack``, ~110 MB) are still used because with random weights or activations
-the attention is spread out and the stale parameters barely change the output (likely, not verified).
-A static batch does not fail, probably because it selects another tactic.
+The bug happens for any data, but it is only visible when the attention is peaked: with spread-out
+attention the stale K and strides barely change the output. The random block therefore sets the q/k
+RMSNorm weights to 3 (``--qk_norm``; the real ones reach 2.5 and 4.4). With 1, the same chunk is off
+by only ~7%. A static batch does not fail, probably because it selects another tactic.
 
 Usage
 -----
-    # 1. once, needs the alpamayo1_5 package, the FP8 checkpoint and the dataset:
+    # needs torch, nvidia-modelopt, torch-tensorrt:
+    python fp8_attn_out_fusion.py run              # fails
+    python fp8_attn_out_fusion.py run --control    # passes
+
+    # optional, the real weights and activations of layer 14 (~110 MB); make-pack needs the
+    # alpamayo1_5 package, the FP8 checkpoint and the dataset:
     python fp8_attn_out_fusion.py make-pack --model <fp8 checkpoint dir> --parquet <clips.parquet> \
         --out fusion_pack.pt
-    # 2. the repro (needs torch, nvidia-modelopt, torch-tensorrt; no checkpoint):
-    python fp8_attn_out_fusion.py run --pack fusion_pack.pt            # fails
-    python fp8_attn_out_fusion.py run --pack fusion_pack.pt --control  # passes
+    python fp8_attn_out_fusion.py run --pack fusion_pack.pt   # fails (~38%)
 
 ``--torchtrt_tools`` is the ``tools/llm`` directory of a Torch-TensorRT checkout (``static_cache_v2``
 and its SDPA converter live there; branch ``alpamayo-vlm-export``).
@@ -80,6 +86,38 @@ def rotate_half(x):
     return torch.cat((-b, a), dim=-1)
 
 
+def random_pack(seed: int = 0, qk_norm: float = 3.0, length: int = 3086) -> dict:
+    """A pack with the shapes of layer 14 and random weights and activations (no FP8 amax: the
+    quantizers are calibrated on ``x``). ``qk_norm`` is the q/k RMSNorm weight: the bug happens for
+    any data, but it is only visible when the attention is peaked (3: ~110% error, 1: ~7%)."""
+    D, NH, NKV, HD = 4096, 32, 8, 128
+    g = torch.Generator().manual_seed(seed)
+    f = torch.arange(length).float()[:, None] / (1e6 ** (torch.arange(0, HD, 2) / HD))
+    emb = torch.cat((f, f), -1)[None]
+    pack = {
+        "x": torch.randn(1, length, D, generator=g).half(),
+        "cos": emb.cos().half(),
+        "sin": emb.sin().half(),
+        "input_norm": torch.ones(D).half(),
+        "q_norm": torch.full((HD,), qk_norm).half(),
+        "k_norm": torch.full((HD,), qk_norm).half(),
+        "eps": 1e-6,
+        "heads": NH,
+        "kv_heads": NKV,
+        "head_dim": HD,
+    }
+    for n, rows in (("q", NH * HD), ("k", NKV * HD), ("v", NKV * HD), ("o", D)):
+        pack[n] = {"weight": (torch.randn(rows, D, generator=g) * 0.02).half()}
+    return pack
+
+
+def load_pack(pack: str, seed: int, qk_norm: float) -> dict:
+    if pack:
+        return torch.load(pack)
+    print(f"random weights and activations (seed {seed}, q/k norm {qk_norm})")
+    return random_pack(seed, qk_norm)
+
+
 class Attention(nn.Module):
     """x + o_proj(sdpa(rope(q_norm(q)), rope(k_norm(k)), v)) on the pre-normed x."""
 
@@ -116,19 +154,35 @@ class Attention(nn.Module):
         return x + self.o_proj(a.transpose(1, 2).reshape(B, T, self.heads * self.hd))
 
 
+def quantize(m: Attention, pack: dict, x, cos, sin) -> None:
+    """ModelOpt FP8 on the four linears, calibrated on ``x``; a real pack's amax replace that."""
+    import modelopt.torch.quantization as mtq
+
+    with torch.no_grad():
+        mtq.quantize(m, mtq.FP8_DEFAULT_CFG, forward_loop=lambda mod: mod(x, cos, sin))
+    for n in m.names:
+        if "input_amax" in pack[n]:  # the calibrated scales of the real model
+            lin = getattr(m, f"{n}_proj")
+            lin.input_quantizer.amax = pack[n]["input_amax"].cuda().half()
+            lin.weight_quantizer.amax = pack[n]["weight_amax"].cuda().half()
+
+
 # --------------------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------------------
 @app.command()
 def run(
-    pack: Annotated[str, typer.Option(help="pack written by make-pack")],
+    pack: Annotated[
+        str, typer.Option(help="pack written by make-pack (default: random weights)")
+    ] = "",
+    seed: Annotated[int, typer.Option(help="random weights: seed")] = 0,
+    qk_norm: Annotated[float, typer.Option(help="random weights: q/k norm weight")] = 3.0,
     control: Annotated[
         bool, typer.Option(help="disable the o_proj input quantizer (passes)")
     ] = False,
     torchtrt_tools: ToolsOpt = DEFAULT_TOOLS,
 ) -> None:
     sys.path.insert(0, torchtrt_tools)
-    import modelopt.torch.quantization as mtq
     import torch_tensorrt
     from modelopt.torch.quantization.utils import export_torch_mode
     from torchtrt_ext import register_sdpa
@@ -143,21 +197,13 @@ def run(
         "| gpu",
         torch.cuda.get_device_name(),
     )
-    pack = torch.load(pack)
+    pack = load_pack(pack, seed, qk_norm)
     x = pack["x"].cuda().half()  # [1, L, H], the input of layer 14
     cos, sin = pack["cos"].cuda().half(), pack["sin"].cuda().half()  # [1, L, 128]
     L, H = x.shape[1], x.shape[2]
 
     m = Attention(pack).cuda().half().eval()
-    mtq.quantize(
-        m,
-        mtq.FP8_DEFAULT_CFG,
-        forward_loop=lambda mod: mod(x[:, :64], cos[:, :64], sin[:, :64]),
-    )
-    for n in m.names:  # the calibrated scales of the real model
-        lin = getattr(m, f"{n}_proj")
-        lin.input_quantizer.amax = pack[n]["input_amax"].cuda().half()
-        lin.weight_quantizer.amax = pack[n]["weight_amax"].cuda().half()
+    quantize(m, pack, x, cos, sin)
     if control:
         m.o_proj.input_quantizer.disable()
     print(
