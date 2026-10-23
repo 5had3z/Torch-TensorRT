@@ -219,20 +219,36 @@ def dequantize_real_quant_weights(module: torch.nn.Module) -> None:
                 # mode) turns it back into values exactly as its forward does.
                 w = wq(m._parameters["weight"]).detach().to(torch.float16)
             wq._dequantize = False
-            wq._fake_quant = True  # must precede the assignment, else the weight is re-compressed
+            wq._fake_quant = (
+                True  # must precede the assignment, else the weight is re-compressed
+            )
             m._parameters["weight"] = torch.nn.Parameter(w, requires_grad=False)
             m.allow_real_quant_gemm = False  # no real-quant GEMM kernels while tracing
 
 
-def separate_sibling_input_scales(module: torch.nn.Module) -> None:
-    """Make the input scales of sibling FP8 linears (q/k/v, gate/up) differ in the last bit.
+def maybe_separate_sibling_input_scales(module: torch.nn.Module) -> None:
+    """
+    TensorRT < 11.5 needs the sibling input-scale workaround (11.5 builds these engines correctly).
+    Fix for below versions by making the input scales of sibling FP8 linears (q/k/v, gate/up) differ
+    in the last bit.
 
     The siblings read the same activation, so their calibrated input amax is identical, while their
     weight amax differs. With identical input Q/DQ and different weight scales TensorRT builds an
-    engine whose output is all NaN (reproduced on a single MLP of the Alpamayo decoder, with random
-    weights too; equal weight scales or any difference in the input scales avoid it). A 0.2% change
-    of an input scale is far below the FP8 grid spacing (6%).
+    engine whose output is all NaN (fixed in TensorRT 11.5, so only applied before it; reproduced on a
+    single MLP of the Alpamayo decoder, with random weights too; equal weight scales or any difference
+    in the input scales avoid it). A 0.2% change of an input scale is far below the FP8 grid spacing (6%).
     """
+    import warnings
+    import tensorrt
+    from packaging.version import Version
+
+    if Version(tensorrt.__version__) < Version("11.5"):
+        return
+
+    warnings.warn(
+        "Sibling input scales cause nan outputs for TensorRT versions below 11.5."
+    )
+
     for m in module.modules():
         for group in (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")):
             if not all(hasattr(m, name) for name in group):
@@ -268,7 +284,7 @@ def prepare_weights(
     cast_to_fp16(module)
     if quantized:
         dequantize_real_quant_weights(module)
-        separate_sibling_input_scales(module)
+        maybe_separate_sibling_input_scales(module)
         if not attention_output_quant:
             disable_attention_output_quantizers(module)
 
@@ -458,7 +474,7 @@ class ExpertStep(torch.nn.Module):
             v = torch.cat([caches[2 * i + 1], v], dim=2)
             # after the concat, as in the HF layer: the expert's quantizers see the whole K/V
             q, k, v = bmm_quantize(attn, q, k, v)
-            out =_folded_gqa_sdpa(q, k, v, mask, attn.scaling)
+            out = _folded_gqa_sdpa(q, k, v, mask, attn.scaling)
             h = h + attn.o_proj(out.transpose(1, 2).reshape(B, L, -1))
             h = h + layer.mlp(layer.post_attention_layernorm(h))
         return self.action_out_proj(self.norm(h))
@@ -531,16 +547,24 @@ def build_vision(args):
         a.float().flatten(), b.float().flatten(), dim=0
     ).item()
     with torch.no_grad():
-        ref_real, _ = visual(pixel_values, grid_thw)  # the original (real-quantized) module
+        ref_real, _ = visual(
+            pixel_values, grid_thw
+        )  # the original (real-quantized) module
     prepare_weights(visual, quantized)
     with torch.no_grad():
-        ref, _ = visual(pixel_values, grid_thw)  # the original forward on the exported weights
+        ref, _ = visual(
+            pixel_values, grid_thw
+        )  # the original forward on the exported weights
     encoder = StaticVisionEncoder(visual, grid_thw).eval()
     with torch.no_grad():
         out, _ = encoder(pixel_values)
     print(f"[vision] wrapper vs original cosine {cosine(out, ref):.6f}")
-    if quantized:  # FP8 GEMMs and fake-quant FP16 GEMMs round differently at the FP8 grid
-        print(f"[vision] fake-quant vs real-quant FP8 cosine {cosine(ref, ref_real):.6f}")
+    if (
+        quantized
+    ):  # FP8 GEMMs and fake-quant FP16 GEMMs round differently at the FP8 grid
+        print(
+            f"[vision] fake-quant vs real-quant FP8 cosine {cosine(ref, ref_real):.6f}"
+        )
     # FP8 rounding differences between two equivalent implementations compound through the tower
     # (checked block by block: 0.999998 after block 0, drifting down with depth).
     threshold = 0.95 if quantized else 0.999

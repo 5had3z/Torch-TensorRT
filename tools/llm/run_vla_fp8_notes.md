@@ -22,7 +22,8 @@ unmodified Hugging Face layers, which apply them on their own.
 ## Problem 1: sibling FP8 GEMMs with identical input scales give an all-NaN engine
 
 **Symptom.** An engine of three or more decoder layers returns NaN for every output. Every FP8 linear works
-alone; it takes two linears that read the same activation (`q/k/v_proj`, `gate/up_proj`).
+alone; it takes two linears that read the same activation (`q/k/v_proj`, `gate/up_proj`). This is fixed
+in `TensorRT 11.5`.
 
 **Cause.** Sibling linears read the same activation, so ModelOpt calibrates the same input amax for them,
 while their weight amax differ. With identical input Q/DQ and different weight scales, TensorRT merges the two
@@ -57,9 +58,9 @@ trt = torch_tensorrt.dynamo.compile(ep, inputs=[x], enabled_precisions={torch.ha
 print(torch.isfinite(trt(x)).all())            # False
 ```
 
-**Workaround.** `separate_sibling_input_scales` nudges the input amax of the second and third sibling by 0.2%
-(far below the FP8 grid spacing of about 6%). Applying the same nudge to the eager FP8 model changes minADE by
-0.01 m or less, so it is not a source of error.
+**Workaround.** For TensorRT versions below `11.5`, `maybe_separate_sibling_input_scales` nudges the input 
+amax of the second and third sibling by 0.2% (far below the FP8 grid spacing of about 6%). Applying the same
+nudge to the eager  FP8 model changes minADE by 0.01 m or less, so it is not a source of error.
 
 ## Problem 2: FP8 Q/DQ on the attention output is fused into the P.V GEMM and is wrong for some chunks
 
